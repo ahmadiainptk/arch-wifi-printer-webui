@@ -84,15 +84,29 @@ def stdin_yes(prompt, default="no"):
 # IPv6 link-local TCP proxy (bypasses IPv4 client-isolation)
 # ---------------------------------------------------------------------------
 class PrinterProxy:
-    def __init__(self, name, listen_port, target_v6, target_port, ifname):
+    def __init__(self, name, listen_port, target_v6, target_port, ifname, target_v4=None):
         self.name = name
         self.listen_port = listen_port
         self.target_v6 = target_v6
         self.target_port = target_port
         self.ifname = ifname
+        self.target_v4 = target_v4  # if set, use IPv4 upstream instead of IPv6
         self._srv = None
         self._threads = []
         self._running = threading.Event()
+
+    def _upstream(self):
+        """Return a connected upstream socket (IPv6 or IPv4)."""
+        if self.target_v4:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((self.target_v4, self.target_port))
+            return s
+        idx = self._ifindex()
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect((self.target_v6, self.target_port, 0, idx))
+        return s
 
     def _ifindex(self):
         try:
@@ -125,19 +139,15 @@ class PrinterProxy:
                     pass
 
     def _handle(self, client):
+        up = None
         try:
-            idx = self._ifindex()
-        except RuntimeError as e:
-            print(f"[{self.name}] proxy error: {e}", flush=True)
-            client.close()
-            return
-        up = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        up.settimeout(10)
-        try:
-            up.connect((self.target_v6, self.target_port, 0, idx))
+            up = self._upstream()
         except Exception as e:
-            print(f"[{self.name}] upstream {self.target_v6}:{self.target_port} fail: {e}", flush=True)
-            client.close()
+            print(f"[{self.name}] upstream fail: {e}", flush=True)
+            try:
+                client.close()
+            except Exception:
+                pass
             return
         up.settimeout(None)
         client.settimeout(None)
@@ -246,6 +256,229 @@ def get_queue():
 
 
 # ---------------------------------------------------------------------------
+# Network printer discovery (mDNS / avahi + direct probe)
+# ---------------------------------------------------------------------------
+def discover_printers(timeout=5):
+    """
+    Scan the LAN for printers via mDNS (avahi-browse) + NDP IPv6 neighbor scan.
+    Returns discovered {name, hostname, ipv4, ipv6, ports, reachable}.
+
+    Why both:
+      - mDNS gives brand/hostname/IPv4 but often wrong (APIPA 169.254) and
+        frequently does NOT advertise the IPv6 link-local the printer actually
+        answers on.
+      - NDP (ping ff02::1) populates the kernel neighbor table with every
+        host's real IPv6 link-local + MAC. On isolated Wi-Fi (Mikrotik) the
+        printer's fe80:: address is the ONLY reachable path.
+    We correlate by MAC where possible.
+    """
+    recs = {}  # hostname -> {name, ipv6, ipv4, types, mac}
+
+    def browse(rt):
+        rc, out, _ = run(["avahi-browse", "-rt", rt], timeout=timeout)
+        return out
+
+    # --- mDNS pass (parallel) ---
+    import concurrent.futures as cf
+    type_outs = {}
+    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {ex.submit(browse, rt): rt for rt in ("_ipp._tcp", "_printer._tcp", "_pdl-datastream._tcp")}
+        for f in cf.as_completed(futs):
+            rt = futs[f]
+            try:
+                type_outs[rt] = f.result()
+            except Exception:
+                type_outs[rt] = ""
+
+    for rt, out in type_outs.items():
+        host = None
+        cur_name = None
+        for line in out.splitlines():
+            line = line.rstrip()
+            # block header resets current host/name
+            if line.startswith("="):
+                nm = re.search(r"=\s+\S+\s+(?:IPv4|IPv6)\s+(.*?)\s+(?:Internet Printer|PDL Printer|UNIX Printer)\s+local", line)
+                cur_name = nm.group(1).strip() if nm else None
+                host = None
+            h = re.search(r"hostname\s*=\s*\[([^\]]+)\]", line)
+            if h:
+                host = h.group(1)
+                if host:
+                    recs.setdefault(host, {"name": None, "ipv6": None, "ipv4": None, "types": set(), "mac": None, "node": None})
+            a = re.search(r"address\s*=\s*\[([^\]]+)\]", line)
+            if a and host:
+                rec = recs[host]
+                ip = a.group(1)
+                rec["types"].add(rt)
+                if cur_name and rec["name"] is None:
+                    rec["name"] = cur_name
+                if ":" in ip:
+                    if rec["ipv6"] is None and ip.startswith("fe80"):
+                        rec["ipv6"] = ip
+                elif rec["ipv4"] is None:
+                    rec["ipv4"] = ip
+
+    # --- derive IPv6 link-local (EUI-64) from a full MAC, if we can get one ---
+    def eui64_linklocal(mac):
+        """fe80:: prefix + EUI-64 (insert fffe, flip U/L bit). mac = aa:bb:cc:dd:ee:ff"""
+        try:
+            b = [int(x, 16) for x in mac.split(":")]
+        except Exception:
+            return None
+        if len(b) != 6:
+            return None
+        b[0] ^= 0x02  # flip universal/local bit
+        import socket as _s
+        raw = bytes([b[0], b[1], b[2], 0xff, 0xfe, b[3], b[4], b[5]])
+        ret = _s.inet_ntop(_s.AF_INET6, b"\xfe\x80\x00\x00" + b"\x00" * 4 + raw)
+        return ret
+
+    # convert hostname -> MAC (Brother: BRW + 12hex)
+    def hostname_mac(hostname):
+        base = hostname.lower().replace(".local", "")
+        if base.startswith("brw"):
+            h = base[3:]
+            if len(h) == 12 and all(c in "0123456789abcdef" for c in h):
+                return ":".join(h[i:i+2] for i in range(0, 12, 2))
+        return None
+
+    for host, rec in recs.items():
+        mac = hostname_mac(host) or rec.get("mac")
+        if mac:
+            rec["mac"] = mac
+            ll = eui64_linklocal(mac)
+            if ll and rec["ipv6"] is None:
+                rec["ipv6"] = ll  # always reachable on isolated Wi-Fi
+
+    # --- optionally enrich EPSON node MAC from NDP if available ---
+    # Ping multicast group with enough packets + wait for slow printers.
+    run(["ping", "-6", "-c", "5", "-W", "2", "-I", IFNAME, "ff02::1"], timeout=timeout)
+    import time as _time
+    _time.sleep(1.5)  # let slow printers answer
+    v6_hosts = []
+    for _ in range(3):
+        rc, out, _ = run(["ip", "-6", "neigh", "show", "dev", IFNAME])
+        v6_hosts = []
+        for line in out.splitlines():
+            # format: fe80::x lladdr 1a:2b:.. state [router]
+            f = line.split()
+            if len(f) >= 3 and f[1] == "lladdr":
+                v6_hosts.append((f[0], f[2].lower()))
+        if v6_hosts:
+            break
+        _time.sleep(0.8)
+    node_mac = {}
+    for fe80, m in v6_hosts:
+        node_mac.setdefault(m.replace(":", "")[-6:], (m, fe80))
+    # known printer OUI prefixes (IEEE registrations)
+    PRINTER_OUI = ("90:0f:0c", "38:1a:52", "e0:bb:9e", "24:1f:5b", "9c:3e:53")
+    oui_node = {}  # node -> (mac, fe80) restricted to printer OUIs
+    for fe80, m in v6_hosts:
+        if m.startswith(PRINTER_OUI):
+            oui_node.setdefault(m.replace(":", "")[-6:], (m, fe80))
+    for host, rec in recs.items():
+        base = host.lower().replace(".local", "")
+        if base.startswith("epson"):
+            node = base[5:]
+            if len(node) == 6:
+                # prefer printer-OUI match, fallback to any node match
+                cand = oui_node.get(node) or node_mac.get(node)
+                if cand:
+                    full, fe80 = cand
+                    if rec["mac"] is None:
+                        rec["mac"] = full
+                    if rec["ipv6"] is None:
+                        ll = eui64_linklocal(full) or fe80
+                        rec["ipv6"] = ll
+
+    results = []
+    for host, rec in recs.items():
+        entry = {
+            "name": rec["name"] or host.split(".")[0],
+            "hostname": host,
+            "ipv4": rec["ipv4"],
+            "ipv6": rec["ipv6"],
+            "mac": rec["mac"],
+            "types": sorted(rec["types"]),
+            "ports": [],
+            "reachable": False,
+        }
+        reach_v6 = bool(rec["ipv6"]) and _probe_v6(rec["ipv6"], IFNAME, 631)
+        reach_v4 = bool(rec["ipv4"]) and _probe_v4(rec["ipv4"], 631)
+        entry["reachable"] = bool(reach_v6 or reach_v4)
+        if reach_v6:
+            entry["ports"] = _ports_v6(rec["ipv6"], IFNAME, [631, 9100, 515, 80, 443])
+            entry["via"] = "ipv6"
+        elif reach_v4:
+            entry["ports"] = _ports_v4(rec["ipv4"], [631, 9100, 515, 80, 443])
+            entry["via"] = "ipv4"
+        results.append(entry)
+    return results
+
+
+def _probe_v6(ip, ifname, port):
+    try:
+        idx = socket.if_nametoindex(ifname)
+    except (OSError, AttributeError):
+        return False
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(3)
+    try:
+        s.connect((ip, port, 0, idx))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _probe_v4(ip, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    try:
+        s.connect((ip, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _ports_v6(ip, ifname, ports):
+    try:
+        idx = socket.if_nametoindex(ifname)
+    except (OSError, AttributeError):
+        return []
+    open_ports = []
+    for p in ports:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.settimeout(1.2)
+        try:
+            s.connect((ip, p, 0, idx))
+            open_ports.append(p)
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return open_ports
+
+
+def _ports_v4(ip, ports):
+    open_ports = []
+    for p in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.2)
+        try:
+            s.connect((ip, p))
+            open_ports.append(p)
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return open_ports
+
+
+# ---------------------------------------------------------------------------
 # HTTP handlers
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (above app/)
@@ -287,6 +520,7 @@ def serve_static(handler, relpath, send_default=[]):
 class Handler(BaseHTTPRequestHandler):
     proxies = None
     cups_queue = CUPS_QUEUE
+    _proxy_next_port = [4000]  # dynamic proxy spawn (scan-add)
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[http] {self.address_string()} {fmt % args}\n")
@@ -322,6 +556,18 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/admin-open":
             # returns the URL (browser opens it client-side) for the printer web admin
             json_resp(self, {"url": f"http://127.0.0.1:{PROXY_WEB_PORT}/"})
+
+        elif path == "/api/scan":
+            # LAN printer scan: mDNS + port probe. Takes a few seconds.
+            try:
+                found = discover_printers()
+                json_resp(self, {"printers": found})
+            except Exception as e:
+                json_resp(self, {"error": str(e)}, 500)
+
+        elif path == "/api/scan/avahi-check":
+            # whether avahi-browse exists
+            json_resp(self, {"avahi": have("avahi-browse")})
 
         elif path.startswith("/api/") or path in ("/", "/index.html"):
             serve_static(self, path.lstrip("/"))
@@ -398,6 +644,69 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/admin-open":
             json_resp(self, {"ok": True, "url": f"http://127.0.0.1:{PROXY_WEB_PORT}/"})
+
+        elif path == "/api/scan/add":
+            # Register a discovered printer into CUPS:
+            #   {hostname, ipv6?, ipv4?, name?}  -> spawn dynamic proxy -> lpadmin -m everywhere
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except Exception:
+                data = {}
+            host = data.get("hostname", "")
+            v6 = data.get("ipv6") or data.get("ipv6_addr")
+            v4 = data.get("ipv4")
+            if not host:
+                json_resp(self, {"ok": False, "error": "hostname required"}, 400)
+                return
+            # pick target: prefer IPv6 (bypasses isolation)
+            if v6:
+                target_v6, target_port = v6, 631
+            elif v4:
+                target_v6, target_port = None, 631
+            else:
+                json_resp(self, {"ok": False, "error": "no address to connect"}, 400)
+                return
+            # allocate a listen port for the new IPP proxy
+            port = Handler._proxy_next_port[0]
+            Handler._proxy_next_port[0] += 1
+            name_slug = host.split(".")[0].replace("_", "-") or "printer"
+            qname = data.get("name") or name_slug
+            # sanitize: lpadmin queue names = [a-z0-9_-], no spaces/uppercase
+            qname = re.sub(r"[^a-z0-9_-]", "-", qname.lower()).strip("-") or "printer"
+            p = None
+            if v6:
+                p = PrinterProxy(f"scan-{name_slug}", port, v6, 631, IFNAME)
+            elif v4:
+                p = PrinterProxy(f"scan-{name_slug}", port, v4, 631, IFNAME, target_v4=v4)
+            if p is None:
+                json_resp(self, {"ok": False, "error": "no address to connect"}, 400)
+                return
+            try:
+                p.start()
+            except Exception as e:
+                json_resp(self, {"ok": False, "error": f"proxy: {e}"}, 500)
+                return
+            prox = Handler.proxies or []
+            prox.append(p)
+            Handler.proxies = prox
+            # register into CUPS via IPP
+            # NOTE: use hostname "localhost" (resolves to 127.0.0.1 but the
+            # printer sees a matching Host header). Some printers (e.g. EPSON)
+            # reject the request if device-uri Host header is 127.0.0.1.
+            # EPSON PPD polling is slow — give lpadmin a generous timeout.
+            rc, out, err = run([
+                "lpadmin", "-p", qname, "-E",
+                "-v", f"ipp://localhost:{port}/ipp/print",
+                "-m", "everywhere",
+            ], timeout=30)
+            if rc != 0:
+                # roll back the proxy if registration failed
+                p.stop()
+                json_resp(self, {"ok": False, "error": err or out, "proxy_port": port}, 500)
+                return
+            run(["lpoptions", "-d", qname])
+            json_resp(self, {"ok": True, "queue": qname, "proxy_port": port,
+                             "via": "ipv6" if target_v6 else "ipv4"})
 
         else:
             json_resp(self, {"error": "not found"}, 404)

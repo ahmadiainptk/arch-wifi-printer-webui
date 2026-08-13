@@ -83,6 +83,7 @@
   <button data-tab="overview" class="active">Overview</button>
   <button data-tab="queue">Queue</button>
   <button data-tab="print">Quick Print</button>
+  <button data-tab="scan">Scan Network</button>
   <button data-tab="admin">Web Admin</button>
 </nav>
 <main>
@@ -123,6 +124,18 @@
         <button class="btn ghost" onclick="clearAll()">Clear</button>
       </div>
       <div class="hint">Note: plain-text only for now. Untuk .docx dengan format kompleks, install libreoffice lalu convert ke PDF dulu.</div>
+    </div>
+  </div>
+
+  <!-- SCAN -->
+  <div class="tab-page" id="tab-scan" style="display:none">
+    <div class="card">
+      <div class="flex" style="justify-content:space-between">
+        <div><div class="section-title">Scan Printer di Jaringan</div><div class="sub">Discover mDNS printer via IPv4 &amp; IPv6 link-local (bypass isolation), lalu probe port</div></div>
+        <button class="btn" id="scan-btn" onclick="runScan()">▸ Scan</button>
+      </div>
+      <div class="hint" style="margin-top:6px" id="scan-loading"></div>
+      <div id="scan-results" style="margin-top:14px"><div class="empty">Klik "Scan" untuk mulai. Butuh <code>avahi-browse</code> (mDNS).</div></div>
     </div>
   </div>
 
@@ -263,6 +276,61 @@ async function openAdmin(){
     $('#admin-url').textContent = d.url;
     window.open(d.url, '_blank');
   }catch(e){ toast('Gagal: '+e.message,'err'); }
+}
+
+// ---- scan network ----
+async function runScan(){
+  const btn = $('#scan-btn'), loading = $('#scan-loading'), out = $('#scan-results');
+  btn.disabled = true;
+  loading.textContent = 'Scanning jaringan untuk printer (mDNS + port probe)…';
+  out.innerHTML = '<div class="empty">Mencari…</div>';
+  try{
+    const d = await jget('/scan');
+    loading.textContent = '';
+    if(d.error) throw new Error(d.error);
+    if(!d.printers.length){ out.innerHTML = '<div class="empty">Tidak ada printer ditemukan via mDNS.</div>'; return; }
+    renderScan(d.printers);
+  }catch(e){
+    loading.textContent = '';
+    out.innerHTML = `<div class="empty">Gagal scan: ${esc(e.message)}</div>`;
+  }finally{ btn.disabled = false; }
+}
+
+function renderScan(list){
+  window._scanList = list;
+  const out = $('#scan-results');
+  const host = (a)=> a ? `<span class="mono">${esc(a)}</span>` : '<span class="hint">—</span>';
+  const badges = (types)=> (types||[]).map(t=>`<span class="badge completed" style="margin-right:4px">${esc(t)}</span>`).join('');
+  let h = `<table><thead><tr><th>Nama</th><th>Reachable</th><th>Ports</th><th>IPv6 / IPv4</th><th>Service</th><th>Action</th></tr></thead><tbody>`;
+  for(let i=0;i<list.length;i++){
+    const p = list[i];
+    const via = p.reachable
+      ? `<span class="badge idle">✓ via ${p.via}</span>`
+      : '<span class="badge disabled">✗</span>';
+    const ports = (p.ports||[]).join(', ') || '—';
+    h += `<tr>
+      <td><b>${esc(p.name)}</b><br><span class="hint">${esc(p.hostname||'')}</span></td>
+      <td>${via}</td>
+      <td>${esc(ports)}</td>
+      <td>${p.via==='ipv6' ? host(p.ipv6)+'<br><span class="hint">'+host(p.ipv4)+'</span>' : host(p.ipv4)+'<br><span class="hint">'+host(p.ipv6)+'</span>'}</td>
+      <td>${badges(p.types)}</td>
+      <td>${p.reachable ? `<button class="btn sm" onclick="addScanned(${i})">+ Add ke CUPS</button>` : ''}</td>
+    </tr>`;
+  }
+  h += '</tbody></table>';
+  out.innerHTML = h;
+}
+
+async function addScanned(i){
+  const p = window._scanList[i];
+  if(!confirm(`Daftarkan "${p.name}" ke CUPS?\n${p.hostname||''}`)) return;
+  try{
+    const d = await jpost('/scan/add', JSON.stringify({
+      hostname: p.hostname, ipv6: p.ipv6, ipv4: p.ipv4, name: p.name
+    }));
+    if(d.ok){ toast(`Ditambahkan: ${d.queue} (proxy :${d.proxy_port})`); loadPrinters(); }
+    else toast(d.error||'gagal', 'err');
+  }catch(e){ toast('Gagal: '+e.message, 'err'); }
 }
 
 // init
