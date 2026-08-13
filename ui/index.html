@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Printer HQ — Wi-Fi Isolated CUPS Manager</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#121821; --panel2:#0f151d; --border:#1f2a37;
+    --txt:#dbe4ee; --dim:#7c8ba1; --acc:#38bdf8; --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  body{background:var(--bg); color:var(--txt); font-family:ui-monospace,'JetBrains Mono',monospace;
+       font-size:13px; line-height:1.5; min-height:100vh}
+  a{color:var(--acc)}
+  header{display:flex; align-items:center; gap:14px; padding:14px 22px; border-bottom:1px solid var(--border);
+         background:linear-gradient(180deg,#101722,#0b0f14); position:sticky; top:0; z-index:10}
+  header .logo{font-size:18px; font-weight:700; color:var(--acc); letter-spacing:.5px}
+  header .logo span{color:var(--dim); font-weight:400}
+  header .status{margin-left:auto; display:flex; gap:10px; align-items:center; font-size:12px}
+  .dot{width:8px; height:8px; border-radius:50%; display:inline-block}
+  .dot.ok{background:var(--ok); box-shadow:0 0 6px var(--ok)}
+  .dot.err{background:var(--err); box-shadow:0 0 6px var(--err)}
+  .dot.wait{background:var(--warn); box-shadow:0 0 6px var(--warn)}
+  nav{display:flex; gap:4px; padding:0 22px; border-bottom:1px solid var(--border); background:var(--panel2)}
+  nav button{background:none; border:none; color:var(--dim); padding:10px 16px; cursor:pointer;
+             font-family:inherit; font-size:13px; border-bottom:2px solid transparent}
+  nav button.active{color:var(--acc); border-bottom-color:var(--acc)}
+  nav button:hover{color:var(--txt)}
+  main{padding:22px; max-width:1100px; margin:0 auto}
+  .card{background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px; margin-bottom:16px}
+  .card h3{font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin-bottom:12px}
+  table{width:100%; border-collapse:collapse}
+  th,td{text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:12.5px}
+  th{color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.5px}
+  tr:hover td{background:var(--panel2)}
+  .badge{display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600}
+  .badge.idle{background:rgba(52,211,153,.15); color:var(--ok)}
+  .badge.disabled{background:rgba(251,113,133,.15); color:var(--err)}
+  .badge.processing{background:rgba(251,191,36,.15); color:var(--warn)}
+  .badge.completed{background:rgba(56,189,248,.15); color:var(--acc)}
+  .btn{background:var(--acc); color:#04121a; border:none; padding:8px 14px; border-radius:6px; cursor:pointer;
+       font-family:inherit; font-size:12.5px; font-weight:600}
+  .btn:hover{filter:brightness(1.1)}
+  .btn.ghost{background:transparent; color:var(--acc); border:1px solid var(--acc)}
+  .btn.danger{background:rgba(251,113,133,.15); color:var(--err); border:1px solid var(--err)}
+  .btn.sm{padding:4px 10px; font-size:11.5px}
+  .btn:disabled{opacity:.5; cursor:not-allowed}
+  .flex{display:flex; gap:10px; align-items:center}
+  .actions{display:flex; gap:6px; justify-content:flex-end}
+  textarea{width:100%; background:var(--panel2); border:1px solid var(--border); color:var(--txt);
+           border-radius:6px; padding:12px; font-family:inherit; font-size:13px; min-height:100px; resize:vertical}
+  input[type=text]{background:var(--panel2); border:1px solid var(--border); color:var(--txt);
+           border-radius:6px; padding:8px 10px; font-family:inherit; width:100%}
+  .hint{color:var(--dim); font-size:12px; margin-top:8px}
+  .toast{position:fixed; bottom:20px; right:20px; background:var(--panel); border:1px solid var(--border);
+         border-left:3px solid var(--acc); padding:12px 18px; border-radius:8px; display:none;
+         box-shadow:0 8px 24px rgba(0,0,0,.5); z-index:100; max-width:380px}
+  .toast.err{border-left-color:var(--err)}
+  .toast.ok{border-left-color:var(--ok)}
+  .empty{color:var(--dim); text-align:center; padding:24px}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+  .mono{font-family:monospace; color:var(--acc)}
+  code{background:var(--panel2); padding:1px 5px; border-radius:4px; color:var(--acc)}
+  .section-title{font-size:15px; color:var(--txt); margin-bottom:4px}
+  .sub{color:var(--dim); font-size:12px; margin-bottom:16px}
+  .refresh{border:1px solid var(--border); background:none; color:var(--dim); padding:6px 12px;
+           border-radius:6px; cursor:pointer; font-family:inherit; font-size:12px}
+  .refresh:hover{color:var(--acc); border-color:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">⌘ Printer<span>HQ</span></div>
+  <div class="status">
+    <span id="st-cups"><span class="dot wait"></span> CUPS</span>
+    <span id="st-proxy"><span class="dot wait"></span> IPv6 proxy</span>
+    <span id="st-queue"><span class="dot wait"></span> queue</span>
+  </div>
+</header>
+<nav>
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="queue">Queue</button>
+  <button data-tab="print">Quick Print</button>
+  <button data-tab="admin">Web Admin</button>
+</nav>
+<main>
+  <!-- OVERVIEW -->
+  <div class="tab-page" id="tab-overview">
+    <div class="card">
+      <div class="flex" style="justify-content:space-between">
+        <div><div class="section-title">Printers</div><div class="sub">CUPS devices reachable via IPv6 link-local bridge</div></div>
+        <button class="refresh" onclick="loadPrinters()">↻ refresh</button>
+      </div>
+      <div id="printers"><div class="empty">Loading printers…</div></div>
+    </div>
+    <div class="card">
+      <h3>How this works</h3>
+      <p class="sub" style="margin:0">Mikrotik client isolation blocks IPv4 unicast between Wi-Fi clients, so CUPS can't reach the printer directly. This app runs a local TCP proxy that bridges <code>127.0.0.1:&lt;port&gt;</code> → printer's IPv6 link-local address (<code>fe80::…</code>), which is <b>never routed</b> and therefore not blocked. CUPS is pointed at localhost via the <code>socket://</code>-style proxy port.</p>
+    </div>
+  </div>
+
+  <!-- QUEUE -->
+  <div class="tab-page" id="tab-queue" style="display:none">
+    <div class="card">
+      <div class="flex" style="justify-content:space-between">
+        <div><div class="section-title">Print Queue</div><div class="sub">Active + completed CUPS jobs</div></div>
+        <button class="refresh" onclick="loadQueue()">↻ refresh</button>
+      </div>
+      <div id="queue"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- QUICK PRINT -->
+  <div class="tab-page" id="tab-print" style="display:none">
+    <div class="card">
+      <div class="section-title">Quick Print</div>
+      <div class="sub">Type or paste text, send to <span class="mono" id="qp-target">…</span></div>
+      <textarea id="qp-text" placeholder="Ketik teks yang mau dicetak…"></textarea>
+      <div class="flex" style="margin-top:12px">
+        <button class="btn" onclick="quickPrint()">Print</button>
+        <button class="btn ghost" onclick="clearAll()">Clear</button>
+      </div>
+      <div class="hint">Note: plain-text only for now. Untuk .docx dengan format kompleks, install libreoffice lalu convert ke PDF dulu.</div>
+    </div>
+  </div>
+
+  <!-- ADMIN -->
+  <div class="tab-page" id="tab-admin" style="display:none">
+    <div class="card">
+      <div class="section-title">Printer Web Admin</div>
+      <div class="sub">Web UI bawaan printer (status, ink, maintenance). Jalan lewat proxy :8080.</div>
+      <div class="flex">
+        <button class="btn" onclick="openAdmin()">Buka Admin Printer →</button>
+        <span class="hint" style="margin:0" id="admin-url"></span>
+      </div>
+      <div class="hint" style="margin-top:14px">Konten admin bisa dibuka di tab baru. Simplifikasi URL admin disediakan via API bila proxy aktif.</div>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const API = '/api';
+
+function toast(msg, type='ok'){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type;
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>{ t.style.display='none'; }, 4000);
+}
+
+async function jget(url){
+  const r = await fetch(API+url);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}
+async function jpost(url, body){ // body can be string (raw) or FormData
+  const r = await fetch(API+url, {method:'POST', body});
+  if(!r.ok){ const t=await r.text(); throw new Error(t); }
+  return r.json();
+}
+
+// ---- nav ----
+document.querySelectorAll('nav button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    document.querySelectorAll('.tab-page').forEach(p=>p.style.display='none');
+    $('#tab-'+b.dataset.tab).style.display='block';
+    if(b.dataset.tab==='queue') loadQueue();
+    if(b.dataset.tab==='overview') loadPrinters();
+  });
+});
+
+function esc(s){
+  const d=document.createElement('div'); d.textContent=String(s); return d.innerHTML;
+}
+
+// ---- status ----
+async function loadStatus(){
+  try{
+    const s = await jget('/status');
+    const set = (id, ok) => { const el=$('#'+id); el.innerHTML = `<span class="dot ${ok?'ok':'err'}"></span> ${ok?'online':'offline'}`; };
+    set('st-cups', s.cups);
+    set('st-proxy', s.proxies.length>0 && s.proxies.filter(p=>p.running).length>0);
+    set('st-queue', s.default_queue ? true : false);
+    $('#qp-target').textContent = s.default_queue || '—';
+  }catch(e){ toast('Status: '+e.message, 'err'); }
+}
+setInterval(loadStatus, 5000);
+
+// ---- printers ----
+async function loadPrinters(){
+  const el = $('#printers');
+  try{
+    const d = await jget('/printers');
+    if(!d.printers.length){ el.innerHTML = '<div class="empty">Tidak ada printer terdaftar di CUPS.</div>'; return; }
+    let h = '<table><thead><tr><th>Printer</th><th>State</th><th>Jobs</th><th>Default</th><th>Action</th></tr></thead><tbody>';
+    for(const p of d.printers){
+      h += `<tr>
+        <td><b>${esc(p.name)}</b><br><span class="hint">${esc(p.enabled_since||'')}</span></td>
+        <td><span class="badge ${p.state}">${esc(p.state)}</span></td>
+        <td>${p.jobs.length}</td>
+        <td>${p.is_default ? '★' : ''}</td>
+        <td><div class="actions">
+          <button class="btn sm ghost" onclick="printerAction('${esc(p.name)}','enable')">enable</button>
+          <button class="btn sm ghost" onclick="printerAction('${esc(p.name)}','disable')">disable</button>
+          <button class="btn sm " onclick="printerAction('${esc(p.name)}','set-default')">default</button>
+        </div></td>
+      </tr>`;
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }catch(e){ el.innerHTML = `<div class="empty">Gagal load printer: ${esc(e.message)}</div>`; }
+}
+
+async function printerAction(name, action){
+  try{
+    const d = await jpost('/printer/action', JSON.stringify({name, action}));
+    if(d.ok){ toast(`${action} → ${name}`); } else { toast(d.error||'gagal','err'); }
+    loadPrinters(); loadQueue();
+  }catch(e){ toast(e.message,'err'); }
+}
+
+// ---- queue ----
+async function loadQueue(){
+  const el = $('#queue');
+  try{
+    const d = await jget('/queue');
+    if(!d.jobs.length){ el.innerHTML = '<div class="empty">Queue kosong — tidak ada job berjalan.</div>'; return; }
+    let h = '<table><thead><tr><th>Job</th><th>User</th><th>Size</th><th>Sent</th></tr></thead><tbody>';
+    for(const j of d.jobs){
+      h += `<tr><td class="mono">${esc(j.id)}</td><td>${esc(j.user)}</td><td>${esc(j.size)}</td><td>${esc(j.time)}</td></tr>`;
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  }catch(e){ el.innerHTML = `<div class="empty">Gagal: ${esc(e.message)}</div>`; }
+}
+
+// ---- quick print ----
+async function quickPrint(){
+  const text = $('#qp-text').value.trim();
+  if(!text){ toast('Ketik teks dulu','err'); return; }
+  try{
+    const d = await jpost('/print', text);
+    if(d.ok) toast('Job terkirim: '+d.message);
+    else toast('Gagal: '+d.error, 'err');
+    loadQueue();
+  }catch(e){ toast('Gagal send: '+e.message,'err'); }
+}
+function clearAll(){ $('#qp-text').value=''; }
+
+// ---- admin ----
+async function openAdmin(){
+  try{
+    const d = await jget('/admin-open');
+    $('#admin-url').textContent = d.url;
+    window.open(d.url, '_blank');
+  }catch(e){ toast('Gagal: '+e.message,'err'); }
+}
+
+// init
+loadStatus(); loadPrinters(); loadQueue();
+</script>
+</body>
+</html>

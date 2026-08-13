@@ -1,0 +1,32 @@
+# arch-wifi-printer-webui.service
+# Printer HQ — CUPS manager + IPv6 link-local printer bridge.
+#
+# Install:  sudo cp arch-wifi-printer-webui.service /etc/systemd/system/
+#           sudo editor /etc/systemd/system/arch-wifi-printer-webui.service  # set ExecStart path & user
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now arch-wifi-printer-webui
+#
+# The service runs as a normal user (no root needed for proxies or CUPS read/print).
+[Unit]
+Description=Printer HQ — WiFi-isolated CUPS manager (IPv6 bridge + web UI)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Point this at the real checkout path + user that owns it.
+User=baha
+Group=baha
+ExecStart=/usr/bin/python3 /home/baha/garapan/arch-wifi-printer-webui/app/server.py
+Restart=on-failure
+RestartSec=3
+Environment=PWEBUI_HOST=0.0.0.0
+Environment=PWEBUI_PORT=8642
+Environment=PWEBUI_CUPS_QUEUE=Brother-DCP-T720DW
+
+# For enable/disable/set-default actions, grant passwordless sudo for cupsenable/cupsdisable/lpoptions.
+# Add to your sudoers (run: sudo visudo -f /etc/sudoers.d/pwebui):
+#   baha ALL=(ALL) NOPASSWD: /usr/bin/cupsenable, /usr/bin/cupsdisable, /usr/bin/lpoptions
+
+[Install]
+WantedBy=multi-user.target
